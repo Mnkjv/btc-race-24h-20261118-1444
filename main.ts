@@ -1,128 +1,162 @@
-// Mean-reversion cbBTC bot for make.fun btc-race-24h-20261118-1444.
+// Mean-reversion dip buyer for cbBTC (agent-fun/bars-replay/v1).
 //
-// Protocol: agent-fun/bars-replay/v1, long only, $1,000 paper USDC, one asset
-// (CBBTC, 1-minute bars from an Orca Whirlpool).
-//
-// Idea: on 1-minute bars BTC is mostly noise (about 6 bps per minute) around a
-// slowly moving 4-hour mean, while a full round trip costs about 26 bps in
-// fees, slippage and price impact. So the bot trades rarely and only for
-// moves much larger than the cost:
-//
-// - Buy a dip: the close at least DIP_BPS below the 240-bar (4h) simple
-//   moving average, while that average is not falling at all (trend guard).
-// - Sell on reversion: the close back above the average, or a take-profit
-//   of TP_BPS over cost, or a stop-loss of STOP_BPS under cost.
-// - One full-size position at a time (up to 100% of equity), no pyramiding.
-// - Equity guard: if equity falls 10% from its peak, flatten and stop
-//   trading for the rest of the window (protects the 25% drawdown bar).
-//
-// Tuned on this race's dev window (a -2.8% day; every baseline loses):
-// DIP 70-80 bps and trend guard -20..0 bps form a stable plateau, all
-// giving the same single winning round trip; DIP=70/TP=80/EXIT=80 chosen.
-// Dev grade: +$6.62 net PnL, 2 trades, max drawdown 0.60%, +$5.82 at 2x fees.
-// A momentum breakout leg was tried and dropped: it added trades but cut
-// the 2x-fee margin to +$0.29.
-//
-// Everything is deterministic: plain float64 arithmetic over the closes in
-// arrival order, no clock, no randomness, no files, no network.
+// Idea: on one-minute bars the pool price wobbles around a slow rolling mean.
+// When the latest close dips far enough below that mean, buy with a fixed
+// slice of equity; when the price reverts through the mean (plus a wide margin),
+// or a take-profit / stop-loss against the actual fill price triggers, sell
+// everything. One position at a time, long only, fully deterministic: all
+// comparisons are exact bigint cross-multiplications, no floats, no clock,
+// no randomness.
 
-import { runBars, type BarsState, type Batch, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
+import { runBars } from './vendor/makefun-bars.ts';
+import type { BarsState, Batch, OrderInput } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
 
-// --- strategy parameters (basis points unless noted) ---
-const SMA_LEN = 240; // 4 hours of 1-minute bars
-const DIP_BPS = 70; // buy when the close is 0.70% under the 4h mean
-const EXIT_ABOVE_BPS = 80; // sell when the close is back 0.80% over the mean
-const TP_BPS = 80; // take profit: +0.80% over the position's cost
-const STOP_BPS = 80; // stop loss: -0.80% under the position's cost
-const TREND_LOOKBACK = 60; // bars over which the 4h mean's slope is measured
-const TREND_MIN_BPS = 0; // do not buy a dip while the mean is falling at all
-const EQUITY_GUARD_BPS = 1000; // halt after a 10% drawdown from peak equity
-const MAX_SLIPPAGE_BPS = 100;
+// Strategy parameters (basis points unless noted). Tuned on the dev window.
+const MEAN_BARS = 120; // rolling mean window, in bars
+const ENTRY_DIP_BPS = 110; // buy when close <= mean * (1 - 110 bps): only deep overshoots
+const EXIT_GAIN_BPS = 240; // sell when close >= mean * (1 + 240 bps): a full recovery, margin set
+// wide on purpose so a deep-dip position is held through the reversion instead of
+// being sold the first time it touches the mean; the take-profit below binds first.
+const TAKE_PROFIT_BPS = 220; // or when close >= entry fill * (1 + 220 bps)
+const STOP_LOSS_BPS = 100; // or when close <= entry fill * (1 - 100 bps)
+const TIME_STOP_BARS = 600; // or after 600 bars in the position, whatever it shows
+const LAST_ENTRY_SEQ = 1250; // no new positions from here on: too little window left
+// for a dip to revert before the end-of-window flatten takes the position out.
+const SPEND_BPS = 6000; // spend 60% of equity on one position
+const ORDER_SLIPPAGE_BPS = 400; // max_slippage_bps sent with every order
+const GUARD_DD_BPS = 1000; // stop opening trades once equity is 10% under its peak
+const MIN_NOTIONAL = 1_000_000n; // 1 USDC in quote units
 
-const BPS = 10_000;
+const BPS_WHOLE = 10_000n;
 
-/** The strategy's running state: closes, the 4h mean and its history. */
-class MeanReversion {
-  /** Last SMA_LEN closes, oldest first, with their running sum. */
-  window: number[] = [];
-  windowSum = 0;
-  /** SMA value after each bar, once seeded. */
-  smaHist: number[] = [];
-  peakEquity: bigint | null = null;
-  halted = false;
+class DipBuyer {
+  closes: bigint[] = [];
+  sum = 0n;
+  peakEquity = 0n;
+  entryPrice: bigint | null = null;
+  entrySeq = -1;
+  orderInFlight = false;
+  orderSeq = 0;
 
-  /** Feed one close; returns the current SMA or null until seeded. */
-  push(close: number): number | null {
-    this.window.push(close);
-    this.windowSum += close;
-    if (this.window.length > SMA_LEN) this.windowSum -= this.window.shift()!;
-    if (this.window.length < SMA_LEN) return null;
-    const sma = this.windowSum / SMA_LEN;
-    this.smaHist.push(sma);
-    return sma;
+  onBatch(state: BarsState, batch: Batch): OrderInput[] {
+    // Fills of the orders decided on the previous batch arrive with this one;
+    // fold them in first so entryPrice tracks the real fill price.
+    for (const fill of batch.fills) {
+      if (fill.status !== 'filled') continue;
+      if (fill.side === 'buy' && fill.symbol === SYMBOL) {
+        this.entryPrice = BigInt(fill.price);
+        this.entrySeq = batch.seq;
+      } else if (fill.side === 'sell' && fill.symbol === SYMBOL) {
+        this.entryPrice = null;
+        this.entrySeq = -1;
+      }
+    }
+    this.orderInFlight = false;
+
+    if (state.equity > this.peakEquity) this.peakEquity = state.equity;
+
+    const bar = batch.bars.find((b) => b.symbol === SYMBOL);
+    if (bar === undefined) return [];
+    const close = BigInt(bar.c);
+
+    this.closes.push(close);
+    this.sum += close;
+    if (this.closes.length > MEAN_BARS) {
+      this.sum -= this.closes.shift() as bigint;
+    }
+    if (state.warmingUp) return [];
+
+    const held = state.positions.get(SYMBOL);
+    const heldQty = held === undefined ? 0n : held.qty;
+
+    if (heldQty > 0n) {
+      if (this.entryPrice === null) this.entryPrice = this.costPrice(state);
+      if (this.shouldSell(close, batch.seq)) {
+        this.orderInFlight = true;
+        return [
+          {
+            side: 'sell',
+            client_id: this.nextId('exit'),
+            symbol: SYMBOL,
+            qty: heldQty,
+            max_slippage_bps: ORDER_SLIPPAGE_BPS,
+          },
+        ];
+      }
+      return [];
+    }
+
+    // Flat: look for a dip. Guard first: no new risk far under the peak.
+    if (this.peakEquity > 0n && state.equity * BPS_WHOLE <= this.peakEquity * (BPS_WHOLE - BigInt(GUARD_DD_BPS))) {
+      return [];
+    }
+    if (batch.seq >= LAST_ENTRY_SEQ) return [];
+    if (this.closes.length < MEAN_BARS) return [];
+    if (!this.isDip(close)) return [];
+
+    const spendByEquity = (state.equity * BigInt(SPEND_BPS)) / BPS_WHOLE;
+    const room = state.weightRoom(SYMBOL);
+    let notional = spendByEquity < state.cash ? spendByEquity : state.cash;
+    if (room < notional) notional = room;
+    if (notional < MIN_NOTIONAL) return [];
+
+    this.orderInFlight = true;
+    return [
+      {
+        side: 'buy',
+        client_id: this.nextId('dip'),
+        symbol: SYMBOL,
+        notional_quote_units: notional,
+        max_slippage_bps: ORDER_SLIPPAGE_BPS,
+      },
+    ];
   }
 
-  /** Slope of the SMA over TREND_LOOKBACK bars, in bps, or null until known. */
-  smaSlopeBps(): number | null {
-    if (this.smaHist.length <= TREND_LOOKBACK) return null;
-    const now = this.smaHist[this.smaHist.length - 1]!;
-    const ago = this.smaHist[this.smaHist.length - 1 - TREND_LOOKBACK]!;
-    if (ago === 0) return null;
-    return ((now - ago) * BPS) / ago;
+  // close <= mean * (1 - ENTRY_DIP_BPS), with mean = sum / count, cross-multiplied.
+  isDip(close: bigint): boolean {
+    const count = BigInt(this.closes.length);
+    return close * count * BPS_WHOLE <= this.sum * (BPS_WHOLE - BigInt(ENTRY_DIP_BPS));
+  }
+
+  // close >= mean * (1 + EXIT_GAIN_BPS), cross-multiplied the same way.
+  isReverted(close: bigint): boolean {
+    const count = BigInt(this.closes.length);
+    return close * count * BPS_WHOLE >= this.sum * (BPS_WHOLE + BigInt(EXIT_GAIN_BPS));
+  }
+
+  shouldSell(close: bigint, seq: number): boolean {
+    if (this.entrySeq >= 0 && seq - this.entrySeq >= TIME_STOP_BARS) return true;
+    if (this.isReverted(close)) return true;
+    const entry = this.entryPrice;
+    if (entry === null || entry <= 0n) return false;
+    if (close * BPS_WHOLE >= entry * (BPS_WHOLE + BigInt(TAKE_PROFIT_BPS))) return true;
+    if (close * BPS_WHOLE <= entry * (BPS_WHOLE - BigInt(STOP_LOSS_BPS))) return true;
+    return false;
+  }
+
+  // Average price implied by the position's cost basis, at the price scale:
+  // cost = qty * price * 10^quote_scale / 10^(qty_scale + price_scale).
+  costPrice(state: BarsState): bigint | null {
+    const held = state.positions.get(SYMBOL);
+    const sym = state.symbols.get(SYMBOL);
+    if (held === undefined || sym === undefined || held.qty <= 0n) return null;
+    const num = held.cost * 10n ** BigInt(sym.qty_scale + sym.price_scale);
+    const den = held.qty * 10n ** BigInt(state.hello.capital.quote_scale);
+    return den === 0n ? null : num / den;
+  }
+
+  nextId(kind: string): string {
+    this.orderSeq += 1;
+    return `${kind}-${this.orderSeq}`;
   }
 }
 
-const strat = new MeanReversion();
+const bot = new DipBuyer();
 
 await runBars({
-  onBatch(state: BarsState, batch: Batch) {
-    // Equity guard bookkeeping (runs on every batch, fresh bar or not).
-    if (strat.peakEquity === null) strat.peakEquity = state.equity;
-    else if (state.equity > strat.peakEquity) strat.peakEquity = state.equity;
-
-    // Only decide on a bar this batch actually carries.
-    let bar = null;
-    for (const b of batch.bars) if (b.symbol === SYMBOL) bar = b;
-    if (bar === null || state.warmingUp) return [];
-    const close = Number(bar.c);
-    const sma = strat.push(close);
-    if (sma === null) return [];
-
-    const held = state.positions.get(SYMBOL);
-    const orders: (BuyInput | SellInput)[] = [];
-
-    if (held !== undefined) {
-      const value = state.value(SYMBOL, held.qty);
-      const cost = held.cost;
-      // Equity guard: flatten and halt for the rest of the window.
-      if (state.equity * BigInt(BPS) <= strat.peakEquity! * BigInt(BPS - EQUITY_GUARD_BPS)) {
-        strat.halted = true;
-        return [{ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
-      }
-      const reverted = close >= sma * (1 + EXIT_ABOVE_BPS / BPS);
-      const takeProfit = value * BigInt(BPS) >= cost * BigInt(BPS + TP_BPS);
-      const stopLoss = value * BigInt(BPS) <= cost * BigInt(BPS - STOP_BPS);
-      if (reverted || takeProfit || stopLoss) {
-        orders.push({ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS });
-      }
-      return orders;
-    }
-
-    // Flat: look for a dip to buy.
-    if (strat.halted) return [];
-    const slope = strat.smaSlopeBps();
-    if (slope === null) return [];
-    const dipped = close <= sma * (1 - DIP_BPS / BPS);
-    const trendOk = slope >= TREND_MIN_BPS;
-    if (dipped && trendOk) {
-      const room = state.weightRoom(SYMBOL);
-      const spend = state.cash < room ? state.cash : room;
-      if (spend >= BigInt(state.hello.fees.min_notional_quote_units)) {
-        orders.push({ side: 'buy', symbol: SYMBOL, notional_quote_units: spend, max_slippage_bps: MAX_SLIPPAGE_BPS });
-      }
-    }
-    return orders;
+  onBatch(state: BarsState, batch: Batch): OrderInput[] {
+    return bot.onBatch(state, batch);
   },
 });
